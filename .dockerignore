@@ -1,0 +1,12 @@
+.git
+.github
+captures/
+logs/
+*.db
+*.db-*
+config*.yaml
+registration.yaml
+mautrix-rift
+mautrix-rift.exe
+.env
+tools/

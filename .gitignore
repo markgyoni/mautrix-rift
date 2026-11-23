@@ -1,0 +1,16 @@
+/mautrix-rift
+/mautrix-rift.exe
+*.db
+*.db-*
+/config*.yaml
+/registration.yaml
+/logs/
+/captures/
+*.har
+.env
+__pycache__/
+*.db.*
+# Local notes: reverse-engineering docs, roadmap, Claude instructions
+/docs/
+CLAUDE.local.md
+.claude/

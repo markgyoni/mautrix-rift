@@ -157,3 +157,22 @@ func (c *Client) UploadMedia(ctx context.Context, shardID string, data []byte, f
 	}
 	return att, nil
 }
+
+// DownloadURL fetches an external file, such as a GIF from Rift's GIF picker (static.klipy.com).
+func (c *Client) DownloadURL(ctx context.Context, u string) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", c.UserAgent)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("download: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+	return data, resp.Header.Get("Content-Type"), err
+}

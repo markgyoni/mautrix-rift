@@ -283,16 +283,22 @@ func (rc *RiftClient) messageContent(ctx context.Context, portal *bridgev2.Porta
 	return text, ast
 }
 
-func (rc *RiftClient) convertText(ctx context.Context, portal *bridgev2.Portal, msg *riftclient.Message) *bridgev2.ConvertedMessagePart {
+// convertText converts a message's text, minus any GIFs it embeds, which it returns separately.
+func (rc *RiftClient) convertText(ctx context.Context, portal *bridgev2.Portal, msg *riftclient.Message) (*bridgev2.ConvertedMessagePart, []gifRef) {
 	text, ast := rc.messageContent(ctx, portal, msg)
+	text, gifs := splitGIFs(text)
+	if gifs != nil {
+		// The AST still holds the markdown; the remaining text is usually empty or a short caption.
+		ast = nil
+	}
 	content := rc.astToMatrix(ctx, ast, text)
 	if msg.Title != nil && strings.TrimSpace(*msg.Title) != "" {
 		prependForumTitle(content, strings.TrimSpace(*msg.Title))
 	}
 	if strings.TrimSpace(content.Body) == "" {
-		return nil
+		return nil, gifs
 	}
-	return &bridgev2.ConvertedMessagePart{Type: event.EventMessage, Content: content}
+	return &bridgev2.ConvertedMessagePart{Type: event.EventMessage, Content: content}, gifs
 }
 
 // prependForumTitle formats a forum post's title above its body (plain text and HTML).
@@ -350,8 +356,16 @@ func (rc *RiftClient) convertAttachment(ctx context.Context, portal *bridgev2.Po
 
 func (rc *RiftClient) convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *riftclient.Message) (*bridgev2.ConvertedMessage, error) {
 	cm := &bridgev2.ConvertedMessage{}
-	if text := rc.convertText(ctx, portal, msg); text != nil {
+	text, gifs := rc.convertText(ctx, portal, msg)
+	if text != nil {
 		cm.Parts = append(cm.Parts, text)
+	}
+	for _, gif := range gifs {
+		cm.Parts = append(cm.Parts, rc.convertGIF(ctx, portal, intent, gif))
+	}
+	if text == nil && len(cm.Parts) > 0 {
+		// A GIF-only message: its first part stands in for the text part, so replies and edits find it.
+		cm.Parts[0].ID = ""
 	}
 	for _, att := range msg.Attachments {
 		cm.Parts = append(cm.Parts, rc.convertAttachment(ctx, portal, intent, att))
@@ -372,7 +386,7 @@ func (rc *RiftClient) convertMessage(ctx context.Context, portal *bridgev2.Porta
 
 func (rc *RiftClient) convertEdit(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, msg *riftclient.Message) (*bridgev2.ConvertedEdit, error) {
 	// Only the text part can be edited; attachments keep their original parts.
-	text := rc.convertText(ctx, portal, msg)
+	text, _ := rc.convertText(ctx, portal, msg)
 	if text == nil || len(existing) == 0 || existing[0].ID == "" || existing[0].PartID != "" {
 		return &bridgev2.ConvertedEdit{}, nil
 	}

@@ -16,7 +16,14 @@ const (
 	PortalKindShard   = "shard"   // Matrix space
 	PortalKindChannel = "channel" // Shard text channel
 	PortalKindDM      = "dm"
+	// PortalKindSplinter is a group chat. It uses the DM endpoints, but without E2EE.
+	PortalKindSplinter = "splinter"
 )
+
+// usesDMEndpoints reports whether a portal's messages live under /dms/{id}.
+func (m *PortalMetadata) usesDMEndpoints() bool {
+	return m.Kind == PortalKindDM || m.Kind == PortalKindSplinter
+}
 
 type PortalMetadata struct {
 	Kind        string `json:"kind"`
@@ -36,6 +43,10 @@ func shardPortalKey(shardID string, login *bridgev2.UserLogin) networkid.PortalK
 
 func channelPortalKey(channelID string, login *bridgev2.UserLogin) networkid.PortalKey {
 	return networkid.PortalKey{ID: networkid.PortalID(channelID), Receiver: login.ID}
+}
+
+func splinterPortalKey(splinterID string, login *bridgev2.UserLogin) networkid.PortalKey {
+	return networkid.PortalKey{ID: networkid.PortalID(splinterID), Receiver: login.ID}
 }
 
 func dmPortalKey(dmID string, login *bridgev2.UserLogin) networkid.PortalKey {

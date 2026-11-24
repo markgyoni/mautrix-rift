@@ -31,6 +31,7 @@ type RiftClient struct {
 	shards    map[string]*riftclient.Shard
 	channels  map[string]*riftclient.Channel
 	dms       map[string]*riftclient.DMChannel
+	splinters map[string]*riftclient.Splinter
 	peerKeys  map[string]peerKey // user ID -> signature-checked X25519 identity key
 	profiles  *profileCache
 
@@ -49,13 +50,14 @@ var (
 func newRiftClient(main *RiftConnector, login *bridgev2.UserLogin) (*RiftClient, error) {
 	meta := login.Metadata.(*UserLoginMetadata)
 	rc := &RiftClient{
-		main:     main,
-		login:    login,
-		client:   riftclient.NewClient(meta.AccessToken, meta.RefreshToken),
-		shards:   map[string]*riftclient.Shard{},
-		channels: map[string]*riftclient.Channel{},
-		dms:      map[string]*riftclient.DMChannel{},
-		peerKeys: map[string]peerKey{},
+		main:      main,
+		login:     login,
+		client:    riftclient.NewClient(meta.AccessToken, meta.RefreshToken),
+		shards:    map[string]*riftclient.Shard{},
+		channels:  map[string]*riftclient.Channel{},
+		dms:       map[string]*riftclient.DMChannel{},
+		splinters: map[string]*riftclient.Splinter{},
+		peerKeys:  map[string]peerKey{},
 
 		shardMembers: map[string]*bridgev2.ChatMemberList{},
 	}
@@ -162,6 +164,11 @@ func (rc *RiftClient) refreshCache(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Splinters are optional: a failure here shouldn't take Shards and DMs down with it.
+	splinters, err := rc.client.ListSplinters(ctx)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to list Splinters")
+	}
 	channels := map[string]*riftclient.Channel{}
 	for _, s := range shards {
 		boot, err := rc.client.ShardBootstrap(ctx, s.ID)
@@ -184,13 +191,34 @@ func (rc *RiftClient) refreshCache(ctx context.Context) error {
 	for _, dm := range dms {
 		rc.dms[dm.ID] = dm
 	}
+	if err == nil {
+		clear(rc.splinters) // left or deleted while offline
+		for _, s := range splinters {
+			rc.splinters[s.ID] = s
+		}
+	}
+	return nil
+}
+
+// refreshSplinters re-lists Splinters, for events about one that isn't cached yet (e.g. just added to it).
+func (rc *RiftClient) refreshSplinters(ctx context.Context) error {
+	splinters, err := rc.client.ListSplinters(ctx)
+	if err != nil {
+		return err
+	}
+	rc.cacheLock.Lock()
+	defer rc.cacheLock.Unlock()
+	clear(rc.splinters)
+	for _, s := range splinters {
+		rc.splinters[s.ID] = s
+	}
 	return nil
 }
 
 // bridgedChannelTypes are the Shard channel types that carry plain chat messages.
 var bridgedChannelTypes = map[string]bool{"text": true, "announcement": true}
 
-// syncChats creates or updates a portal for every Shard space, DM and text channel. LatestMessageTS lets
+// syncChats creates or updates a portal for every Shard space, DM, Splinter and text channel. LatestMessageTS lets
 // bridgev2 run a catch-up backfill for chats that got messages while the bridge was offline.
 func (rc *RiftClient) syncChats(ctx context.Context) {
 	type chat struct {
@@ -198,13 +226,16 @@ func (rc *RiftClient) syncChats(ctx context.Context) {
 		latest time.Time
 	}
 	rc.cacheLock.RLock()
-	chats := make([]chat, 0, len(rc.shards)+len(rc.dms)+len(rc.channels))
+	chats := make([]chat, 0, len(rc.shards)+len(rc.dms)+len(rc.splinters)+len(rc.channels))
 	// Shard spaces first, so their name and icon stay current (they were only set on creation).
 	for id := range rc.shards {
 		chats = append(chats, chat{key: shardPortalKey(id, rc.login)})
 	}
 	for id, dm := range rc.dms {
 		chats = append(chats, chat{dmPortalKey(id, rc.login), dm.LastActivityAt})
+	}
+	for id, s := range rc.splinters {
+		chats = append(chats, chat{splinterPortalKey(id, rc.login), s.LastActivityAt})
 	}
 	for id, ch := range rc.channels {
 		if bridgedChannelTypes[ch.ChannelType] {

@@ -109,6 +109,12 @@ func (rc *RiftClient) handleEvent(ctx context.Context, evt *riftclient.Event) {
 			LastTarget: networkid.MessageID(r.LastReadMessageID),
 			ReadUpTo:   r.LastReadAt,
 		})
+	case "SPLINTER_UPDATE":
+		var u riftclient.SplinterUpdate
+		if err := json.Unmarshal(evt.Data, &u); err != nil || u.ID == "" {
+			return
+		}
+		rc.handleSplinterUpdate(ctx, evt, &u)
 	case "MEMBER_JOIN", "MEMBER_LEAVE", "MEMBER_REMOVE", "MEMBER_BAN":
 		var m riftclient.MemberEvent
 		if err := json.Unmarshal(evt.Data, &m); err != nil || m.ShardID == "" || m.UserID == "" {
@@ -127,7 +133,7 @@ func (rc *RiftClient) sender(userID string) bridgev2.EventSender {
 	return bridgev2.EventSender{Sender: networkid.UserID(userID)}
 }
 
-// portalKeyFor maps a Rift channel or DM ID to its portal key.
+// portalKeyFor maps a Rift channel, DM or Splinter ID to its portal key.
 func (rc *RiftClient) portalKeyFor(chatID string) networkid.PortalKey {
 	rc.cacheLock.RLock()
 	_, isDM := rc.dms[chatID]
@@ -315,6 +321,39 @@ func (rc *RiftClient) queueMemberChange(evt *riftclient.Event, m *riftclient.Mem
 			},
 		})
 	}
+}
+
+// handleSplinterUpdate mirrors the web client: a deleted Splinter, or one the user left or was removed
+// from, goes away; an update carrying the name and member list replaces the cached Splinter. Anything
+// else (a partial payload) triggers a re-list. The payload shape comes from the web bundle.
+func (rc *RiftClient) handleSplinterUpdate(ctx context.Context, evt *riftclient.Event, u *riftclient.SplinterUpdate) {
+	key := splinterPortalKey(u.ID, rc.login)
+	selfRemoved := u.RemovedUserID == string(rc.login.ID) && (u.Action == "member_removed" || u.Action == "member_left")
+	if u.Deleted || selfRemoved {
+		rc.cacheLock.Lock()
+		delete(rc.splinters, u.ID)
+		rc.cacheLock.Unlock()
+		rc.login.QueueRemoteEvent(&simplevent.ChatDelete{
+			EventMeta: simplevent.EventMeta{Type: bridgev2.RemoteEventChatDelete, PortalKey: key, Timestamp: evt.Timestamp},
+		})
+		return
+	}
+	if u.Name != "" && u.Members != nil {
+		s := u.Splinter
+		rc.cacheLock.Lock()
+		if old, ok := rc.splinters[u.ID]; ok && s.LastActivityAt.IsZero() {
+			s.LastActivityAt = old.LastActivityAt
+		}
+		rc.splinters[u.ID] = &s
+		rc.cacheLock.Unlock()
+	} else if err := rc.refreshSplinters(ctx); err != nil {
+		zerolog.Ctx(ctx).Err(err).Str("splinter_id", u.ID).Msg("Failed to refresh Splinters after update")
+		return
+	}
+	rc.login.QueueRemoteEvent(&simplevent.ChatResync{
+		EventMeta:       simplevent.EventMeta{Type: bridgev2.RemoteEventChatResync, PortalKey: key, CreatePortal: true, Timestamp: evt.Timestamp},
+		GetChatInfoFunc: rc.GetChatInfo,
+	})
 }
 
 func derefStr(s *string) string {

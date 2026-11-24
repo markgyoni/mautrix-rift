@@ -399,6 +399,10 @@ func (c *Client) ListDMs(ctx context.Context) (out []*DMChannel, err error) {
 	return out, c.do(ctx, http.MethodGet, "/dms", nil, &out, reqOpts{})
 }
 
+func (c *Client) ListSplinters(ctx context.Context) (out []*Splinter, err error) {
+	return out, c.do(ctx, http.MethodGet, "/splinters", nil, &out, reqOpts{})
+}
+
 func (c *Client) GetProfiles(ctx context.Context, ids ...string) (out []*Profile, err error) {
 	return out, c.do(ctx, http.MethodPost, "/users/profiles/batch", map[string][]string{"ids": ids}, &out, reqOpts{})
 }
@@ -498,9 +502,12 @@ func (c *Client) SendTyping(ctx context.Context, channelID string) error {
 }
 
 // SendDM encrypts plaintext (see EncodeDMPlaintext) with rift-dm-v4 and sends it to a DM channel. Attachments travel unencrypted
-// next to the payload (the text may be empty, which still gets encrypted).
-func (c *Client) SendDM(ctx context.Context, keys *AccountKeys, dmID, recipientIdentityHex, text, replyToID string, attachments []*Attachment) (*Message, error) {
-	cid := uuid.NewString()
+// next to the payload (the text may be empty, which still gets encrypted). cid is the client_message_id
+// (bound into the AAD); a new one is generated if empty.
+func (c *Client) SendDM(ctx context.Context, keys *AccountKeys, dmID, recipientIdentityHex, cid, text, replyToID string, attachments []*Attachment) (*Message, error) {
+	if cid == "" {
+		cid = uuid.NewString()
+	}
 	payload, err := EncryptDMv4(keys.DMPrivate, recipientIdentityHex, cid, nil, text, nil, nil)
 	if err != nil {
 		return nil, err
@@ -522,6 +529,24 @@ func (c *Client) EditDM(ctx context.Context, keys *AccountKeys, dmID, messageID,
 	}
 	body := map[string]any{"content": "", "e2ee_payload": payload, "content_ast": nil}
 	return c.do(ctx, http.MethodPatch, "/dms/"+url.PathEscape(dmID)+"/messages/"+url.PathEscape(messageID), body, nil, reqOpts{})
+}
+
+// SendSplinterMessage posts a plaintext message to a Splinter. Splinters share the DM endpoints but
+// aren't E2EE; the web client sends them with message_kind "legacy_plaintext" (from the bundle; received
+// Splinter messages carry message_kind "envelope").
+func (c *Client) SendSplinterMessage(ctx context.Context, splinterID string, req *SendMessageRequest) (out *Message, err error) {
+	if req.ClientMessageID == "" {
+		req.ClientMessageID = uuid.NewString()
+	}
+	req.MessageKind = "legacy_plaintext"
+	return out, c.do(ctx, http.MethodPost, "/dms/"+url.PathEscape(splinterID)+"/messages", req, &out, reqOpts{})
+}
+
+// EditSplinterMessage edits a plaintext Splinter message (PATCH {content, content_ast}, inferred from the
+// channel edit body and the web client's editDmMessage; not captured yet).
+func (c *Client) EditSplinterMessage(ctx context.Context, splinterID, messageID, content string, ast *Node) error {
+	body := map[string]any{"content": content, "content_ast": ast}
+	return c.do(ctx, http.MethodPatch, "/dms/"+url.PathEscape(splinterID)+"/messages/"+url.PathEscape(messageID), body, nil, reqOpts{})
 }
 
 func (c *Client) DeleteDM(ctx context.Context, dmID, messageID string) error {

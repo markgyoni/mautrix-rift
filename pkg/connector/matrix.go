@@ -27,7 +27,7 @@ func (rc *RiftClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgText, event.MsgNotice:
 	case event.MsgEmote:
 	case event.MsgImage, event.MsgVideo, event.MsgAudio, event.MsgFile:
-		att, err := rc.uploadMatrixMedia(ctx, msg, meta.ShardID) // ShardID is empty for DMs
+		att, err := rc.uploadMatrixMedia(ctx, msg, meta.ShardID) // ShardID is empty for DMs and Splinters
 		if err != nil {
 			return nil, err
 		}
@@ -56,7 +56,17 @@ func (rc *RiftClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	var sent *riftclient.Message
 	var err error
-	if meta.Kind == PortalKindDM {
+	req := &riftclient.SendMessageRequest{
+		Content:         text,
+		Attachments:     attachments,
+		ReplyToID:       replyTo,
+		ClientMessageID: cid,
+	}
+	if ast != nil {
+		req.ContentAST, _ = json.Marshal(ast)
+	}
+	switch meta.Kind {
+	case PortalKindDM:
 		if rc.keys == nil {
 			return nil, errDMKeysMissing
 		}
@@ -64,17 +74,10 @@ func (rc *RiftClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if peerKey, err = rc.dmPeerKey(ctx, msg.Portal); err != nil {
 			return nil, err
 		}
-		sent, err = rc.client.SendDM(ctx, rc.keys, string(msg.Portal.ID), peerKey, riftclient.EncodeDMPlaintext(text, ast), replyTo, attachments)
-	} else {
-		req := &riftclient.SendMessageRequest{
-			Content:         text,
-			Attachments:     attachments,
-			ReplyToID:       replyTo,
-			ClientMessageID: cid,
-		}
-		if ast != nil {
-			req.ContentAST, _ = json.Marshal(ast)
-		}
+		sent, err = rc.client.SendDM(ctx, rc.keys, string(msg.Portal.ID), peerKey, cid, riftclient.EncodeDMPlaintext(text, ast), replyTo, attachments)
+	case PortalKindSplinter:
+		sent, err = rc.client.SendSplinterMessage(ctx, string(msg.Portal.ID), req)
+	default:
 		sent, err = rc.client.SendMessage(ctx, string(msg.Portal.ID), req)
 	}
 	if err != nil {
@@ -108,12 +111,16 @@ func (rc *RiftClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Matrix
 		plain := riftclient.EncodeDMPlaintext(msg.Content.Body, rc.matrixToRift(ctx, msg.Content, msg.Content.Body))
 		return rc.client.EditDM(ctx, rc.keys, dmID, msgID, firstNonEmpty(orig.ClientMessageID, msgID), peerKey, plain)
 	}
-	_, err := rc.client.EditMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), msg.Content.Body, rc.matrixToRift(ctx, msg.Content, msg.Content.Body))
+	ast := rc.matrixToRift(ctx, msg.Content, msg.Content.Body)
+	if msg.Portal.Metadata.(*PortalMetadata).Kind == PortalKindSplinter {
+		return rc.client.EditSplinterMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), msg.Content.Body, ast)
+	}
+	_, err := rc.client.EditMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), msg.Content.Body, ast)
 	return err
 }
 
 func (rc *RiftClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
-	if msg.Portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+	if msg.Portal.Metadata.(*PortalMetadata).usesDMEndpoints() {
 		return rc.client.DeleteDM(ctx, string(msg.Portal.ID), string(msg.TargetMessage.ID))
 	}
 	return rc.client.DeleteMessage(ctx, string(msg.Portal.ID), string(msg.TargetMessage.ID))
@@ -132,14 +139,14 @@ func (rc *RiftClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2
 }
 
 func (rc *RiftClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
-	if msg.Portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+	if msg.Portal.Metadata.(*PortalMetadata).usesDMEndpoints() {
 		return nil, rc.client.AddDMReaction(ctx, string(msg.Portal.ID), string(msg.TargetMessage.ID), msg.PreHandleResp.Emoji)
 	}
 	return nil, rc.client.AddReaction(ctx, string(msg.TargetMessage.ID), msg.PreHandleResp.Emoji)
 }
 
 func (rc *RiftClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReactionRemove) error {
-	if msg.Portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+	if msg.Portal.Metadata.(*PortalMetadata).usesDMEndpoints() {
 		return rc.client.RemoveDMReaction(ctx, string(msg.Portal.ID), string(msg.TargetReaction.MessageID), string(msg.TargetReaction.EmojiID))
 	}
 	return rc.client.RemoveReaction(ctx, string(msg.TargetReaction.MessageID), string(msg.TargetReaction.EmojiID))
@@ -195,7 +202,7 @@ func (rc *RiftClient) HandleMatrixReadReceipt(ctx context.Context, receipt *brid
 			return err
 		}
 	}
-	if receipt.Portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+	if receipt.Portal.Metadata.(*PortalMetadata).usesDMEndpoints() {
 		return rc.client.AckDM(ctx, string(receipt.Portal.ID), string(target.ID))
 	}
 	return rc.client.AckChannel(ctx, string(receipt.Portal.ID), string(target.ID))

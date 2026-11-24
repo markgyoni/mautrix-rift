@@ -20,7 +20,7 @@ var _ bridgev2.BackfillingNetworkAPI = (*RiftClient)(nil)
 const maxHistoryPage = 50
 
 func (rc *RiftClient) fetchHistory(ctx context.Context, portal *bridgev2.Portal, p riftclient.HistoryParams) ([]*riftclient.Message, error) {
-	if portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+	if portal.Metadata.(*PortalMetadata).usesDMEndpoints() {
 		return rc.client.GetDMMessages(ctx, string(portal.ID), p)
 	}
 	return rc.client.GetMessages(ctx, string(portal.ID), p)

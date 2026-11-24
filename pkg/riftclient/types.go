@@ -97,6 +97,37 @@ type DMChannel struct {
 	LastActivityAt    time.Time `json:"last_activity_at"`
 }
 
+// Splinter is a group chat (GET /splinters, confirmed). It isn't listed in GET /dms, but its messages,
+// reactions, typing and read markers use the DM endpoints and DM_* gateway events with the Splinter ID.
+type Splinter struct {
+	ID             string            `json:"id"`
+	Kind           string            `json:"kind"` // "splinter"
+	Name           string            `json:"name"`
+	IconURL        *string           `json:"icon_url"`
+	OwnerID        string            `json:"owner_id"`
+	Members        []*SplinterMember `json:"members"`
+	CreatedAt      time.Time         `json:"created_at"`
+	LastActivityAt time.Time         `json:"last_activity_at"`
+}
+
+type SplinterMember struct {
+	UserID      string  `json:"user_id"`
+	Username    string  `json:"username"`
+	DisplayName *string `json:"display_name"`
+	AvatarURL   *string `json:"avatar_url"`
+	IsOwner     bool    `json:"is_owner"`
+}
+
+// SplinterUpdate is the SPLINTER_UPDATE gateway payload (from the web bundle, not captured yet): the
+// Splinter object when it changes, or {id, deleted: true}, or a member change with action
+// ("member_removed", "member_left", ...) and removed_user_id.
+type SplinterUpdate struct {
+	Splinter
+	Deleted       bool   `json:"deleted"`
+	Action        string `json:"action"`
+	RemovedUserID string `json:"removed_user_id"`
+}
+
 type MessageAuthor struct {
 	DisplayName string `json:"display_name"`
 }
@@ -120,7 +151,7 @@ type Message struct {
 	Author          *MessageAuthor  `json:"author,omitempty"`
 	Content         string          `json:"content"`
 	ContentAST      json.RawMessage `json:"content_ast,omitempty"`
-	MessageKind     string          `json:"message_kind,omitempty"` // "e2ee" for DMs
+	MessageKind     string          `json:"message_kind,omitempty"` // "e2ee" for DMs, "envelope" for Splinters
 	E2EEPayload     *E2EEPayload    `json:"e2ee_payload,omitempty"`
 	Attachments     []*Attachment   `json:"attachments"`
 	Reactions       []*Reaction     `json:"reactions,omitempty"`

@@ -19,17 +19,63 @@ func (rc *RiftClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	if shardID, ok := strings.CutPrefix(id, shardPortalPrefix); ok {
 		return rc.shardInfo(shardID)
 	}
-	rc.cacheLock.RLock()
-	ch, isChannel := rc.channels[id]
-	dm, isDM := rc.dms[id]
-	rc.cacheLock.RUnlock()
-	switch {
-	case isChannel:
-		return rc.channelInfo(ctx, ch), nil
-	case isDM:
-		return rc.dmInfo(dm), nil
-	default:
-		return nil, fmt.Errorf("unknown Rift chat %s", id)
+	for attempt := 0; ; attempt++ {
+		rc.cacheLock.RLock()
+		ch, isChannel := rc.channels[id]
+		dm, isDM := rc.dms[id]
+		splinter, isSplinter := rc.splinters[id]
+		rc.cacheLock.RUnlock()
+		switch {
+		case isChannel:
+			return rc.channelInfo(ctx, ch), nil
+		case isDM:
+			return rc.dmInfo(dm), nil
+		case isSplinter:
+			return rc.splinterInfo(splinter), nil
+		}
+		// A message in a Splinter we were just added to can arrive before SPLINTER_UPDATE.
+		if attempt > 0 || portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+			return nil, fmt.Errorf("unknown Rift chat %s", id)
+		}
+		if err := rc.refreshSplinters(ctx); err != nil {
+			return nil, fmt.Errorf("unknown Rift chat %s (refreshing Splinters failed: %w)", id, err)
+		}
+	}
+}
+
+func (rc *RiftClient) splinterInfo(s *riftclient.Splinter) *bridgev2.ChatInfo {
+	roomType := database.RoomTypeDefault
+	members := &bridgev2.ChatMemberList{
+		IsFull:  true,
+		Members: []bridgev2.ChatMember{{EventSender: rc.selfSender(), Membership: event.MembershipJoin}},
+	}
+	ownerPL := 50 // shows the Splinter owner as a moderator
+	for _, m := range s.Members {
+		if m.UserID == string(rc.login.ID) {
+			if m.IsOwner {
+				members.Members[0].PowerLevel = &ownerPL
+			}
+			continue
+		}
+		p := &riftclient.Profile{ID: m.UserID, Username: m.Username, DisplayName: m.DisplayName, AvatarURL: m.AvatarURL}
+		rc.profiles.put(p)
+		member := bridgev2.ChatMember{
+			EventSender: bridgev2.EventSender{Sender: networkid.UserID(m.UserID)},
+			Membership:  event.MembershipJoin,
+			UserInfo:    rc.profileUserInfo(p),
+		}
+		if m.IsOwner {
+			member.PowerLevel = &ownerPL
+		}
+		members.Members = append(members.Members, member)
+	}
+	return &bridgev2.ChatInfo{
+		Name:         &s.Name,
+		Type:         &roomType,
+		Avatar:       rc.mediaAvatar(s.IconURL),
+		Members:      members,
+		CanBackfill:  true,
+		ExtraUpdates: setPortalMeta(&PortalMetadata{Kind: PortalKindSplinter}),
 	}
 }
 

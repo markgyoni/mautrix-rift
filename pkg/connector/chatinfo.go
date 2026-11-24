@@ -101,13 +101,26 @@ func (rc *RiftClient) shardInfo(shardID string) (*bridgev2.ChatInfo, error) {
 
 func (rc *RiftClient) channelInfo(ctx context.Context, ch *riftclient.Channel) *bridgev2.ChatInfo {
 	parent := shardPortalKey(ch.ShardID, rc.login).ID
+	name := ch.Name
+	if ch.ChannelType == "thread" && ch.ParentID != nil && *ch.ParentID != "" {
+		rc.cacheLock.RLock()
+		parentCh := rc.channels[*ch.ParentID]
+		rc.cacheLock.RUnlock()
+		if parentCh != nil && parentCh.Name != "" {
+			name = "#" + parentCh.Name + " › " + ch.Name
+		}
+	}
 	return &bridgev2.ChatInfo{
-		Name:         &ch.Name,
-		Topic:        ch.Topic,
-		ParentID:     &parent,
-		Members:      rc.shardMemberList(ctx, ch.ShardID),
-		CanBackfill:  true,
-		ExtraUpdates: setPortalMeta(&PortalMetadata{Kind: PortalKindChannel, ShardID: ch.ShardID}),
+		Name:        &name,
+		Topic:       ch.Topic,
+		ParentID:    &parent,
+		Members:     rc.shardMemberList(ctx, ch.ShardID),
+		CanBackfill: true,
+		ExtraUpdates: setPortalMeta(&PortalMetadata{
+			Kind:        PortalKindChannel,
+			ChannelType: ch.ChannelType,
+			ShardID:     ch.ShardID,
+		}),
 	}
 }
 
@@ -167,7 +180,7 @@ func (rc *RiftClient) dmInfo(dm *riftclient.DMChannel) *bridgev2.ChatInfo {
 func setPortalMeta(want *PortalMetadata) bridgev2.ExtraUpdater[*bridgev2.Portal] {
 	return func(ctx context.Context, portal *bridgev2.Portal) bool {
 		meta := portal.Metadata.(*PortalMetadata)
-		if meta.Kind == want.Kind && meta.ShardID == want.ShardID && meta.RecipientID == want.RecipientID {
+		if meta.Kind == want.Kind && meta.ChannelType == want.ChannelType && meta.ShardID == want.ShardID && meta.RecipientID == want.RecipientID {
 			return false
 		}
 		// The pinned DM key belongs to the recipient, so it only survives if the recipient does.

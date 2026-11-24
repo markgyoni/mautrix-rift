@@ -39,11 +39,21 @@ type Channel struct {
 	ShardID     string  `json:"shard_id"`
 	ParentID    *string `json:"parent_id"`
 	Name        string  `json:"name"`
-	ChannelType string  `json:"channel_type"` // text, voice, gallery, polls, counting, forum, ...
+	ChannelType string  `json:"channel_type"` // text, voice, gallery, polls, counting, forum, thread, ...
 	Topic       *string `json:"topic"`
 	Position    int     `json:"position"`
 	// LastMessageAt is in the Shard bootstrap (null for empty channels).
 	LastMessageAt *time.Time `json:"last_message_at"`
+}
+
+// ShardThread is one entry of GET /shards/{id}/threads (confirmed). Channel threads
+// (kind=="channel", channel_type=="thread") are not included in /shards/{id}/bootstrap.
+type ShardThread struct {
+	Kind            string     `json:"kind"` // "channel" or "message"
+	ID              string     `json:"id"`
+	ParentChannelID string     `json:"parent_channel_id"`
+	Name            string     `json:"name"`
+	LastActivityAt  *time.Time `json:"last_activity_at"`
 }
 
 // ShardMember is one entry of GET /shards/{id}/members/window.
@@ -142,24 +152,27 @@ type Attachment struct {
 	ThumbR2Key string `json:"thumb_r2_key,omitempty"`
 }
 
-// Message covers both Shard channel messages and DM messages.
+// Message covers both Shard channel messages (including forum posts and thread replies) and DM messages.
 type Message struct {
-	ID              string          `json:"id"`
-	ChannelID       string          `json:"channel_id,omitempty"`
-	DMChannelID     string          `json:"dm_channel_id,omitempty"`
-	AuthorID        string          `json:"author_id"`
-	Author          *MessageAuthor  `json:"author,omitempty"`
-	Content         string          `json:"content"`
-	ContentAST      json.RawMessage `json:"content_ast,omitempty"`
-	MessageKind     string          `json:"message_kind,omitempty"` // "e2ee" for DMs, "envelope" for Splinters
-	E2EEPayload     *E2EEPayload    `json:"e2ee_payload,omitempty"`
-	Attachments     []*Attachment   `json:"attachments"`
-	Reactions       []*Reaction     `json:"reactions,omitempty"`
-	ReplyToID       *string         `json:"reply_to_id"`
-	ThreadID        *string         `json:"thread_id"`
-	ClientMessageID string          `json:"client_message_id"`
-	CreatedAt       time.Time       `json:"created_at"`
-	EditedAt        *time.Time      `json:"edited_at"`
+	ID               string          `json:"id"`
+	ChannelID        string          `json:"channel_id,omitempty"`
+	DMChannelID      string          `json:"dm_channel_id,omitempty"`
+	AuthorID         string          `json:"author_id"`
+	Author           *MessageAuthor  `json:"author,omitempty"`
+	Title            *string         `json:"title,omitempty"` // forum post title
+	PostState        *string         `json:"post_state,omitempty"`
+	Content          string          `json:"content"`
+	ContentAST       json.RawMessage `json:"content_ast,omitempty"`
+	MessageKind      string          `json:"message_kind,omitempty"` // "e2ee" for DMs, "envelope" for Splinters
+	E2EEPayload      *E2EEPayload    `json:"e2ee_payload,omitempty"`
+	Attachments      []*Attachment   `json:"attachments"`
+	Reactions        []*Reaction     `json:"reactions,omitempty"`
+	ReplyToID        *string         `json:"reply_to_id"`
+	ThreadID         *string         `json:"thread_id"`
+	ThreadReplyCount int             `json:"thread_reply_count"`
+	ClientMessageID  string          `json:"client_message_id"`
+	CreatedAt        time.Time       `json:"created_at"`
+	EditedAt         *time.Time      `json:"edited_at"`
 }
 
 // Reaction is the per-emoji summary on a message object. UserIDs may be a sample when
@@ -173,10 +186,12 @@ type Reaction struct {
 
 // SendMessageRequest is the body of POST /messages/{channel} and /dms/{dm}/messages.
 type SendMessageRequest struct {
+	Title           string          `json:"title,omitempty"`
 	Content         string          `json:"content"`
 	ContentAST      json.RawMessage `json:"content_ast,omitempty"`
 	ReplyPing       bool            `json:"reply_ping"`
 	ReplyToID       string          `json:"reply_to_id,omitempty"`
+	ThreadID        string          `json:"thread_id,omitempty"`
 	ClientMessageID string          `json:"client_message_id"`
 	Attachments     []*Attachment   `json:"attachments,omitempty"`
 	MessageKind     string          `json:"message_kind,omitempty"`

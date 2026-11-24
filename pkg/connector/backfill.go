@@ -19,9 +19,15 @@ var _ bridgev2.BackfillingNetworkAPI = (*RiftClient)(nil)
 // maxHistoryPage caps one history request; the web client asks for 40-50.
 const maxHistoryPage = 50
 
-func (rc *RiftClient) fetchHistory(ctx context.Context, portal *bridgev2.Portal, p riftclient.HistoryParams) ([]*riftclient.Message, error) {
+func (rc *RiftClient) fetchHistory(ctx context.Context, portal *bridgev2.Portal, threadRoot networkid.MessageID, p riftclient.HistoryParams) ([]*riftclient.Message, error) {
 	if portal.Metadata.(*PortalMetadata).usesDMEndpoints() {
+		if threadRoot != "" {
+			return rc.client.GetDMThreadMessages(ctx, string(portal.ID), string(threadRoot), p)
+		}
 		return rc.client.GetDMMessages(ctx, string(portal.ID), p)
+	}
+	if threadRoot != "" {
+		return rc.client.GetThreadMessages(ctx, string(portal.ID), string(threadRoot), p)
 	}
 	return rc.client.GetMessages(ctx, string(portal.ID), p)
 }
@@ -44,9 +50,6 @@ func parseHistoryCursor(c networkid.PaginationCursor) (time.Time, string, error)
 // Forward fetches (catch-up after downtime) page back from the newest message until they reach the
 // anchor, so they only rely on the confirmed "before" semantics.
 func (rc *RiftClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
-	if params.ThreadRoot != "" {
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
 	pageSize := min(max(params.Count, 1), maxHistoryPage)
 	log := zerolog.Ctx(ctx)
 	var msgs []*riftclient.Message
@@ -57,7 +60,7 @@ func (rc *RiftClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		p := riftclient.HistoryParams{Limit: pageSize}
 	pages:
 		for len(msgs) < params.Count {
-			page, err := rc.fetchHistory(ctx, params.Portal, p)
+			page, err := rc.fetchHistory(ctx, params.Portal, params.ThreadRoot, p)
 			if err != nil {
 				return nil, err
 			}
@@ -88,7 +91,7 @@ func (rc *RiftClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		case params.AnchorMessage != nil:
 			p.Before, p.BeforeID = params.AnchorMessage.Timestamp, string(params.AnchorMessage.ID)
 		}
-		page, err := rc.fetchHistory(ctx, params.Portal, p)
+		page, err := rc.fetchHistory(ctx, params.Portal, params.ThreadRoot, p)
 		if err != nil {
 			return nil, err
 		}
@@ -98,12 +101,12 @@ func (rc *RiftClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 			resp.Cursor = historyCursor(page[len(page)-1])
 		}
 	}
-	log.Debug().Bool("forward", params.Forward).Int("count", len(msgs)).Msg("Fetched Rift history")
+	log.Debug().Bool("forward", params.Forward).Str("thread_root", string(params.ThreadRoot)).Int("count", len(msgs)).Msg("Fetched Rift history")
 
 	// Rift returns newest first; bridgev2 wants oldest first.
 	slices.SortStableFunc(msgs, func(a, b *riftclient.Message) int { return a.CreatedAt.Compare(b.CreatedAt) })
 	for _, m := range msgs {
-		if bm := rc.backfillMessage(ctx, params.Portal, m); bm != nil {
+		if bm := rc.backfillMessage(ctx, params.Portal, m, params.ThreadRoot == ""); bm != nil {
 			resp.Messages = append(resp.Messages, bm)
 		}
 	}
@@ -113,7 +116,7 @@ func (rc *RiftClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	return resp, nil
 }
 
-func (rc *RiftClient) backfillMessage(ctx context.Context, portal *bridgev2.Portal, m *riftclient.Message) *bridgev2.BackfillMessage {
+func (rc *RiftClient) backfillMessage(ctx context.Context, portal *bridgev2.Portal, m *riftclient.Message, allowThreadBackfill bool) *bridgev2.BackfillMessage {
 	sender := rc.sender(m.AuthorID)
 	intent, ok := portal.GetIntentFor(ctx, sender, rc.login, bridgev2.RemoteEventMessage)
 	if !ok {
@@ -124,11 +127,12 @@ func (rc *RiftClient) backfillMessage(ctx context.Context, portal *bridgev2.Port
 		return nil
 	}
 	bm := &bridgev2.BackfillMessage{
-		ConvertedMessage: converted,
-		Sender:           sender,
-		ID:               networkid.MessageID(m.ID),
-		TxnID:            networkid.TransactionID(m.ClientMessageID),
-		Timestamp:        m.CreatedAt,
+		ConvertedMessage:     converted,
+		Sender:               sender,
+		ID:                   networkid.MessageID(m.ID),
+		TxnID:                networkid.TransactionID(m.ClientMessageID),
+		Timestamp:            m.CreatedAt,
+		ShouldBackfillThread: allowThreadBackfill && m.ThreadReplyCount > 0,
 	}
 	for _, r := range m.Reactions {
 		emojiID, emoji, extra := rc.riftReactionToMatrix(ctx, r.Emoji)

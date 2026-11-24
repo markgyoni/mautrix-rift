@@ -27,6 +27,7 @@ func (m *PortalMetadata) usesDMEndpoints() bool {
 
 type PortalMetadata struct {
 	Kind        string `json:"kind"`
+	ChannelType string `json:"channel_type,omitempty"` // text, announcement, forum, thread
 	ShardID     string `json:"shard_id,omitempty"`
 	RecipientID string `json:"recipient_id,omitempty"`
 	// PeerIdentityKey is the DM recipient's X25519 key (hex) pinned on first use. Rift keys never

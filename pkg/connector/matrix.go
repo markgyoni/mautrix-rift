@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,15 +52,34 @@ func (rc *RiftClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if msg.ReplyTo != nil {
 		replyTo = string(msg.ReplyTo.ID)
 	}
+	threadID := ""
+	if msg.ThreadRoot != nil {
+		threadID = string(msg.ThreadRoot.ID)
+	}
+	// A top-level message sent into a Forum room creates a new forum post: first line is the title,
+	// remaining lines are the body. A single-line message uses the text for both so neither is empty.
+	var forumTitle string
+	if meta.ChannelType == "forum" && threadID == "" {
+		var body string
+		if forumTitle, body = splitForumPost(text); body != "" && body != text {
+			text = body
+			ast = rc.matrixToRift(ctx, &event.MessageEventContent{MsgType: event.MsgText, Body: text}, text)
+		}
+		if forumTitle == "" && len(attachments) > 0 {
+			forumTitle = firstNonEmpty(attachments[0].Filename, "Post")
+		}
+	}
 	cid := uuid.NewString()
 	msg.AddPendingToIgnore(networkid.TransactionID(cid))
 
 	var sent *riftclient.Message
 	var err error
 	req := &riftclient.SendMessageRequest{
+		Title:           forumTitle,
 		Content:         text,
 		Attachments:     attachments,
 		ReplyToID:       replyTo,
+		ThreadID:        threadID,
 		ClientMessageID: cid,
 	}
 	if ast != nil {
@@ -74,7 +94,7 @@ func (rc *RiftClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if peerKey, err = rc.dmPeerKey(ctx, msg.Portal); err != nil {
 			return nil, err
 		}
-		sent, err = rc.client.SendDM(ctx, rc.keys, string(msg.Portal.ID), peerKey, cid, riftclient.EncodeDMPlaintext(text, ast), replyTo, attachments)
+		sent, err = rc.client.SendDM(ctx, rc.keys, string(msg.Portal.ID), peerKey, cid, riftclient.EncodeDMPlaintext(text, ast), replyTo, threadID, attachments)
 	case PortalKindSplinter:
 		sent, err = rc.client.SendSplinterMessage(ctx, string(msg.Portal.ID), req)
 	default:
@@ -109,13 +129,23 @@ func (rc *RiftClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Matrix
 			return err
 		}
 		plain := riftclient.EncodeDMPlaintext(msg.Content.Body, rc.matrixToRift(ctx, msg.Content, msg.Content.Body))
-		return rc.client.EditDM(ctx, rc.keys, dmID, msgID, firstNonEmpty(orig.ClientMessageID, msgID), peerKey, plain)
+		return rc.client.EditDM(ctx, rc.keys, dmID, msgID, firstNonEmpty(orig.ClientMessageID, msgID), orig.ThreadID, peerKey, plain)
 	}
-	ast := rc.matrixToRift(ctx, msg.Content, msg.Content.Body)
-	if msg.Portal.Metadata.(*PortalMetadata).Kind == PortalKindSplinter {
-		return rc.client.EditSplinterMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), msg.Content.Body, ast)
+	text := msg.Content.Body
+	ast := rc.matrixToRift(ctx, msg.Content, text)
+	meta := msg.Portal.Metadata.(*PortalMetadata)
+	if meta.Kind == PortalKindSplinter {
+		return rc.client.EditSplinterMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), text, ast)
 	}
-	_, err := rc.client.EditMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), msg.Content.Body, ast)
+	// A forum post shows in Matrix as "title, then body". The web client only ever edits the body
+	// (PATCH {content, content_ast}), so drop the first line and keep Rift's title as it is.
+	if meta.ChannelType == "forum" && msg.EditTarget.ThreadRoot == "" {
+		if _, body := splitForumPost(text); body != text {
+			text = body
+			ast = rc.matrixToRift(ctx, &event.MessageEventContent{MsgType: event.MsgText, Body: text}, text)
+		}
+	}
+	_, err := rc.client.EditMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), text, ast)
 	return err
 }
 
@@ -175,6 +205,25 @@ func (rc *RiftClient) uploadMatrixMedia(ctx context.Context, msg *bridgev2.Matri
 	}
 	up.Width, up.Height = att.Width, att.Height
 	return up, nil
+}
+
+// splitForumPost turns a Matrix message into a forum post: the first line (without a leading markdown
+// "#") is the title and the remaining lines are the body. A single-line message keeps its text as the
+// body too, so neither is empty. Empty text gives an empty title.
+func splitForumPost(text string) (title, body string) {
+	first, rest, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	first = strings.TrimSpace(first)
+	if first == "" {
+		return "", text
+	}
+	title = strings.TrimSpace(strings.TrimLeft(first, "#"))
+	if title == "" {
+		title = first
+	}
+	if rest = strings.TrimSpace(rest); rest != "" {
+		return title, rest
+	}
+	return title, text
 }
 
 // emoteAST italicises every text node, matching the "*text*" content sent for /me.

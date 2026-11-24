@@ -395,6 +395,11 @@ func (c *Client) ShardBootstrap(ctx context.Context, shardID string) (out *Shard
 	return out, c.do(ctx, http.MethodGet, "/shards/"+url.PathEscape(shardID)+"/bootstrap", nil, &out, reqOpts{})
 }
 
+// ListShardThreads returns channel threads (kind=="channel") in a Shard, which aren't in ShardBootstrap.
+func (c *Client) ListShardThreads(ctx context.Context, shardID string) (out []*ShardThread, err error) {
+	return out, c.do(ctx, http.MethodGet, "/shards/"+url.PathEscape(shardID)+"/threads", nil, &out, reqOpts{})
+}
+
 func (c *Client) ListDMs(ctx context.Context) (out []*DMChannel, err error) {
 	return out, c.do(ctx, http.MethodGet, "/dms", nil, &out, reqOpts{})
 }
@@ -453,14 +458,31 @@ func (p HistoryParams) query() string {
 	return q.Encode()
 }
 
-// GetMessages fetches a page of a Shard channel's history, newest first.
+// GetMessages fetches a page of a Shard channel's (or forum's) history, newest first.
 func (c *Client) GetMessages(ctx context.Context, channelID string, p HistoryParams) (out []*Message, err error) {
 	return out, c.do(ctx, http.MethodGet, "/messages/"+url.PathEscape(channelID)+"?"+p.query(), nil, &out, reqOpts{})
 }
 
-// GetDMMessages fetches a page of a DM's history, newest first.
+// GetThreadMessages fetches a page of replies in a channel or forum post thread, newest first.
+func (c *Client) GetThreadMessages(ctx context.Context, channelID, threadID string, p HistoryParams) (out []*Message, err error) {
+	return out, c.do(ctx, http.MethodGet, "/messages/"+url.PathEscape(channelID)+"/threads/"+url.PathEscape(threadID)+"?"+p.query(), nil, &out, reqOpts{})
+}
+
+// GetDMMessages fetches a page of a DM's or Splinter's history, newest first.
 func (c *Client) GetDMMessages(ctx context.Context, dmID string, p HistoryParams) (out []*Message, err error) {
 	return out, c.do(ctx, http.MethodGet, "/dms/"+url.PathEscape(dmID)+"/messages?"+p.query(), nil, &out, reqOpts{})
+}
+
+// GetDMThreadMessages fetches a page of replies in a DM or Splinter thread, newest first.
+func (c *Client) GetDMThreadMessages(ctx context.Context, dmID, threadID string, p HistoryParams) (out []*Message, err error) {
+	q := p.query()
+	prefix := "thread_id=" + url.QueryEscape(threadID) + "&include_threads=false"
+	if q != "" {
+		q = prefix + "&" + q
+	} else {
+		q = prefix
+	}
+	return out, c.do(ctx, http.MethodGet, "/dms/"+url.PathEscape(dmID)+"/messages?"+q, nil, &out, reqOpts{})
 }
 
 func (c *Client) SendMessage(ctx context.Context, channelID string, req *SendMessageRequest) (out *Message, err error) {
@@ -503,16 +525,20 @@ func (c *Client) SendTyping(ctx context.Context, channelID string) error {
 
 // SendDM encrypts plaintext (see EncodeDMPlaintext) with rift-dm-v4 and sends it to a DM channel. Attachments travel unencrypted
 // next to the payload (the text may be empty, which still gets encrypted). cid is the client_message_id
-// (bound into the AAD); a new one is generated if empty.
-func (c *Client) SendDM(ctx context.Context, keys *AccountKeys, dmID, recipientIdentityHex, cid, text, replyToID string, attachments []*Attachment) (*Message, error) {
+// (bound into the AAD); a new one is generated if empty. threadID, if non-empty, sends into that DM thread and binds it into AAD.
+func (c *Client) SendDM(ctx context.Context, keys *AccountKeys, dmID, recipientIdentityHex, cid, text, replyToID, threadID string, attachments []*Attachment) (*Message, error) {
 	if cid == "" {
 		cid = uuid.NewString()
 	}
-	payload, err := EncryptDMv4(keys.DMPrivate, recipientIdentityHex, cid, nil, text, nil, nil)
+	var tidPtr *string
+	if threadID != "" {
+		tidPtr = &threadID
+	}
+	payload, err := EncryptDMv4(keys.DMPrivate, recipientIdentityHex, cid, tidPtr, text, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	req := &SendMessageRequest{MessageKind: "e2ee", ClientMessageID: cid, E2EEPayload: payload, ReplyToID: replyToID, Attachments: attachments}
+	req := &SendMessageRequest{MessageKind: "e2ee", ClientMessageID: cid, E2EEPayload: payload, ReplyToID: replyToID, ThreadID: threadID, Attachments: attachments}
 	var out *Message
 	return out, c.do(ctx, http.MethodPost, "/dms/"+url.PathEscape(dmID)+"/messages", req, &out, reqOpts{})
 }
@@ -521,9 +547,9 @@ func (c *Client) GetDMMessage(ctx context.Context, dmID, messageID string) (out 
 	return out, c.do(ctx, http.MethodGet, "/dms/"+url.PathEscape(dmID)+"/messages/"+url.PathEscape(messageID), nil, &out, reqOpts{})
 }
 
-// EditDM re-encrypts plaintext (see EncodeDMPlaintext) under the message's original client_message_id (the AAD binds it).
-func (c *Client) EditDM(ctx context.Context, keys *AccountKeys, dmID, messageID, clientMessageID, recipientIdentityHex, text string) error {
-	payload, err := EncryptDMv4(keys.DMPrivate, recipientIdentityHex, clientMessageID, nil, text, nil, nil)
+// EditDM re-encrypts plaintext (see EncodeDMPlaintext) under the message's original client_message_id and thread_id (the AAD binds both).
+func (c *Client) EditDM(ctx context.Context, keys *AccountKeys, dmID, messageID, clientMessageID string, threadID *string, recipientIdentityHex, text string) error {
+	payload, err := EncryptDMv4(keys.DMPrivate, recipientIdentityHex, clientMessageID, threadID, text, nil, nil)
 	if err != nil {
 		return err
 	}

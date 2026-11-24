@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"path"
 	"strings"
 	"time"
@@ -24,18 +25,19 @@ func (rc *RiftClient) handleEvent(ctx context.Context, evt *riftclient.Event) {
 	log.Debug().RawJSON("data", evt.Data).Msg("Rift gateway event")
 	switch evt.Type {
 	case "MESSAGE_CREATE", "MESSAGE_UPDATE", "DM_MESSAGE_CREATE", "DM_MESSAGE_UPDATE":
-		var msg riftclient.Message
-		if err := json.Unmarshal(evt.Data, &msg); err != nil {
+		msg, del, err := parseMessageEvent(evt)
+		switch {
+		case err != nil:
 			log.Err(err).Msg("Failed to parse message")
-			return
+		case del != nil:
+			rc.queueDelete(evt, del)
+		case msg != nil:
+			rc.queueMessage(evt.Type, msg)
 		}
-		// DM deletes arrive as DM_MESSAGE_CREATE {"deleted":true,"message_id":...,"dm_channel_id":...}.
-		var del riftclient.MessageDeleteEvent
-		if json.Unmarshal(evt.Data, &del) == nil && del.Deleted {
-			rc.queueDelete(evt, &del)
-			return
-		}
-		rc.queueMessage(evt.Type, &msg)
+	case "FORUM_POST_CREATE", "THREAD_READ_UPDATE":
+		// FORUM_POST_CREATE duplicates MESSAGE_CREATE; THREAD_READ_UPDATE is thread-scoped so shouldn't
+		// move the main room's read receipt.
+		return
 	case "MESSAGE_DELETE", "DM_MESSAGE_DELETE":
 		var del riftclient.MessageDeleteEvent
 		if err := json.Unmarshal(evt.Data, &del); err != nil {
@@ -91,10 +93,53 @@ func (rc *RiftClient) handleEvent(ctx context.Context, evt *riftclient.Event) {
 		}
 	case "CHANNEL_CREATE", "CHANNEL_UPDATE":
 		var ch riftclient.Channel
-		if err := json.Unmarshal(evt.Data, &ch); err == nil {
+		if err := json.Unmarshal(evt.Data, &ch); err == nil && ch.ID != "" {
 			rc.cacheLock.Lock()
 			rc.channels[ch.ID] = &ch
 			rc.cacheLock.Unlock()
+			if bridgedChannelTypes[ch.ChannelType] {
+				rc.login.QueueRemoteEvent(&simplevent.ChatResync{
+					EventMeta: simplevent.EventMeta{
+						Type:         bridgev2.RemoteEventChatResync,
+						PortalKey:    channelPortalKey(ch.ID, rc.login),
+						CreatePortal: true,
+						Timestamp:    evt.Timestamp,
+					},
+					GetChatInfoFunc: rc.GetChatInfo,
+				})
+			}
+		}
+	case "CHANNEL_DELETE":
+		var ch struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(evt.Data, &ch); err == nil && ch.ID != "" {
+			rc.cacheLock.Lock()
+			delete(rc.channels, ch.ID)
+			rc.cacheLock.Unlock()
+			rc.login.QueueRemoteEvent(&simplevent.ChatDelete{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventChatDelete,
+					PortalKey: channelPortalKey(ch.ID, rc.login),
+					Timestamp: evt.Timestamp,
+				},
+			})
+		}
+	case "SHARD_CREATE", "SHARD_UPDATE":
+		var s riftclient.Shard
+		if err := json.Unmarshal(evt.Data, &s); err != nil || s.ID == "" || s.Name == "" {
+			return
+		}
+		rc.cacheLock.Lock()
+		_, known := rc.shards[s.ID]
+		if known {
+			rc.shards[s.ID] = &s
+		}
+		rc.cacheLock.Unlock()
+		if known {
+			rc.queueResync(shardPortalKey(s.ID, rc.login), time.Time{}) // name/icon/description changes
+		} else {
+			go rc.joinShard(ctx, &s)
 		}
 	case "CHANNEL_READ_UPDATE", "DM_READ_UPDATE":
 		var r riftclient.ReadUpdate
@@ -124,6 +169,45 @@ func (rc *RiftClient) handleEvent(ctx context.Context, evt *riftclient.Event) {
 	default:
 		log.Trace().RawJSON("data", evt.Data).Msg("Unhandled gateway event")
 	}
+}
+
+// parseMessageEvent sorts a (DM_)MESSAGE_CREATE/UPDATE payload into a message to bridge, a delete, or
+// nothing (both nil) for the non-message events Rift sends under these types (confirmed in captures):
+//   - DM deletes: DM_MESSAGE_CREATE {"deleted": true, "message_id", "dm_channel_id", ...}
+//   - DM thread read markers: DM_MESSAGE_CREATE {"dm_channel_id", "thread_id", "thread_read": true}
+//   - thread reply count bumps on the root message: DM_MESSAGE_CREATE {"thread_updated": true, ...} and
+//     MESSAGE_UPDATE with the root's old edited_at (null if never edited). Only an edited_at close to
+//     the event time is a real edit.
+func parseMessageEvent(evt *riftclient.Event) (*riftclient.Message, *riftclient.MessageDeleteEvent, error) {
+	var flags struct {
+		Deleted       bool `json:"deleted"`
+		ThreadRead    bool `json:"thread_read"`
+		ThreadUpdated bool `json:"thread_updated"`
+	}
+	if err := json.Unmarshal(evt.Data, &flags); err != nil {
+		return nil, nil, err
+	}
+	if flags.Deleted {
+		var del riftclient.MessageDeleteEvent
+		if err := json.Unmarshal(evt.Data, &del); err != nil {
+			return nil, nil, err
+		}
+		return nil, &del, nil
+	}
+	if flags.ThreadRead || flags.ThreadUpdated {
+		return nil, nil, nil
+	}
+	var msg riftclient.Message
+	if err := json.Unmarshal(evt.Data, &msg); err != nil {
+		return nil, nil, err
+	}
+	if msg.ID == "" {
+		return nil, nil, nil
+	}
+	if (evt.Type == "MESSAGE_UPDATE" || evt.Type == "DM_MESSAGE_UPDATE") && !isFreshEdit(msg.EditedAt, evt.Timestamp) {
+		return nil, nil, nil
+	}
+	return &msg, nil, nil
 }
 
 func (rc *RiftClient) sender(userID string) bridgev2.EventSender {
@@ -202,10 +286,31 @@ func (rc *RiftClient) messageContent(ctx context.Context, portal *bridgev2.Porta
 func (rc *RiftClient) convertText(ctx context.Context, portal *bridgev2.Portal, msg *riftclient.Message) *bridgev2.ConvertedMessagePart {
 	text, ast := rc.messageContent(ctx, portal, msg)
 	content := rc.astToMatrix(ctx, ast, text)
+	if msg.Title != nil && strings.TrimSpace(*msg.Title) != "" {
+		prependForumTitle(content, strings.TrimSpace(*msg.Title))
+	}
 	if strings.TrimSpace(content.Body) == "" {
 		return nil
 	}
 	return &bridgev2.ConvertedMessagePart{Type: event.EventMessage, Content: content}
+}
+
+// prependForumTitle formats a forum post's title above its body (plain text and HTML).
+func prependForumTitle(content *event.MessageEventContent, title string) {
+	body := strings.TrimSpace(content.Body)
+	if body == "" {
+		content.Body = title
+		content.Format = event.FormatHTML
+		content.FormattedBody = "<h3>" + html.EscapeString(title) + "</h3>"
+		return
+	}
+	bodyHTML := content.FormattedBody
+	if content.Format != event.FormatHTML || bodyHTML == "" {
+		bodyHTML = strings.ReplaceAll(html.EscapeString(content.Body), "\n", "<br>")
+	}
+	content.Body = title + "\n\n" + content.Body
+	content.Format = event.FormatHTML
+	content.FormattedBody = "<h3>" + html.EscapeString(title) + "</h3>" + bodyHTML
 }
 
 func (rc *RiftClient) convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, att *riftclient.Attachment) *bridgev2.ConvertedMessagePart {
@@ -255,8 +360,12 @@ func (rc *RiftClient) convertMessage(ctx context.Context, portal *bridgev2.Porta
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if msg.ReplyToID != nil {
+	if msg.ReplyToID != nil && *msg.ReplyToID != "" {
 		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: networkid.MessageID(*msg.ReplyToID)}
+	}
+	if msg.ThreadID != nil && *msg.ThreadID != "" {
+		tid := networkid.MessageID(*msg.ThreadID)
+		cm.ThreadRoot = &tid
 	}
 	return cm, nil
 }
@@ -354,6 +463,19 @@ func (rc *RiftClient) handleSplinterUpdate(ctx context.Context, evt *riftclient.
 		EventMeta:       simplevent.EventMeta{Type: bridgev2.RemoteEventChatResync, PortalKey: key, CreatePortal: true, Timestamp: evt.Timestamp},
 		GetChatInfoFunc: rc.GetChatInfo,
 	})
+}
+
+// isFreshEdit reports whether editedAt belongs to the update event at evtTS (rather than an earlier edit
+// repeated in an unrelated update). A missing event timestamp falls back to trusting editedAt.
+func isFreshEdit(editedAt *time.Time, evtTS time.Time) bool {
+	if editedAt == nil {
+		return false
+	}
+	if evtTS.IsZero() {
+		return true
+	}
+	d := evtTS.Sub(*editedAt)
+	return d > -time.Minute && d < time.Minute
 }
 
 func derefStr(s *string) string {

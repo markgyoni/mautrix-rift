@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -26,6 +27,7 @@ type RiftClient struct {
 	keys   *riftclient.AccountKeys // nil if no Rift Key: DMs unavailable
 
 	stop context.CancelFunc
+	gw   atomic.Pointer[riftclient.Gateway] // current gateway session, for subscribing to newly joined Shards
 
 	cacheLock sync.RWMutex
 	shards    map[string]*riftclient.Shard
@@ -112,7 +114,9 @@ func (rc *RiftClient) runLoop(ctx context.Context) {
 		}
 		gw := rc.client.NewGateway(func(evt *riftclient.Event) { rc.handleEvent(ctx, evt) })
 		start := time.Now()
+		rc.gw.Store(gw)
 		err := gw.Run(ctx, rc.onGatewayReady)
+		rc.gw.CompareAndSwap(gw, nil)
 		if ctx.Err() != nil {
 			return
 		}
@@ -171,13 +175,13 @@ func (rc *RiftClient) refreshCache(ctx context.Context) error {
 	}
 	channels := map[string]*riftclient.Channel{}
 	for _, s := range shards {
-		boot, err := rc.client.ShardBootstrap(ctx, s.ID)
+		shardChannels, err := rc.fetchShardChannels(ctx, s.ID)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Str("shard_id", s.ID).Msg("Failed to bootstrap shard")
 			continue
 		}
-		for _, ch := range boot.Channels {
-			channels[ch.ID] = ch
+		for id, ch := range shardChannels {
+			channels[id] = ch
 		}
 	}
 	rc.cacheLock.Lock()
@@ -200,6 +204,83 @@ func (rc *RiftClient) refreshCache(ctx context.Context) error {
 	return nil
 }
 
+// fetchShardChannels returns a Shard's channels from its bootstrap plus its named channel threads,
+// which the bootstrap doesn't include.
+func (rc *RiftClient) fetchShardChannels(ctx context.Context, shardID string) (map[string]*riftclient.Channel, error) {
+	boot, err := rc.client.ShardBootstrap(ctx, shardID)
+	if err != nil {
+		return nil, err
+	}
+	channels := make(map[string]*riftclient.Channel, len(boot.Channels))
+	for _, ch := range boot.Channels {
+		channels[ch.ID] = ch
+	}
+	threads, err := rc.client.ListShardThreads(ctx, shardID)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Str("shard_id", shardID).Msg("Failed to list shard threads")
+		return channels, nil
+	}
+	for _, t := range threads {
+		if t.Kind != "channel" || t.ID == "" {
+			continue
+		}
+		if _, exists := channels[t.ID]; exists {
+			continue
+		}
+		parentID := t.ParentChannelID
+		channels[t.ID] = &riftclient.Channel{
+			ID:            t.ID,
+			ShardID:       shardID,
+			ParentID:      &parentID,
+			Name:          t.Name,
+			ChannelType:   "thread",
+			LastMessageAt: t.LastActivityAt,
+		}
+	}
+	return channels, nil
+}
+
+// joinShard sets up a Shard the user joined while connected (Rift sends SHARD_UPDATE with the full
+// Shard object on join, confirmed 2026-11-24): fetch its channels, subscribe, and create its rooms.
+func (rc *RiftClient) joinShard(ctx context.Context, s *riftclient.Shard) {
+	log := zerolog.Ctx(ctx).With().Str("shard_id", s.ID).Logger()
+	channels, err := rc.fetchShardChannels(ctx, s.ID)
+	if err != nil {
+		log.Err(err).Msg("Failed to bootstrap newly joined shard")
+		return
+	}
+	rc.cacheLock.Lock()
+	rc.shards[s.ID] = s
+	for id, ch := range channels {
+		rc.channels[id] = ch
+	}
+	rc.cacheLock.Unlock()
+	if gw := rc.gw.Load(); gw != nil {
+		if err := gw.SubscribeShard(ctx, s.ID); err != nil {
+			log.Err(err).Msg("Failed to subscribe to newly joined shard")
+		}
+	}
+	log.Info().Int("channels", len(channels)).Msg("Joined shard")
+	rc.queueResync(shardPortalKey(s.ID, rc.login), time.Time{})
+	for id, ch := range channels {
+		if bridgedChannelTypes[ch.ChannelType] {
+			var latest time.Time
+			if ch.LastMessageAt != nil {
+				latest = *ch.LastMessageAt
+			}
+			rc.queueResync(channelPortalKey(id, rc.login), latest)
+		}
+	}
+}
+
+func (rc *RiftClient) queueResync(key networkid.PortalKey, latest time.Time) {
+	rc.login.QueueRemoteEvent(&simplevent.ChatResync{
+		EventMeta:       simplevent.EventMeta{Type: bridgev2.RemoteEventChatResync, PortalKey: key, CreatePortal: true},
+		GetChatInfoFunc: rc.GetChatInfo,
+		LatestMessageTS: latest,
+	})
+}
+
 // refreshSplinters re-lists Splinters, for events about one that isn't cached yet (e.g. just added to it).
 func (rc *RiftClient) refreshSplinters(ctx context.Context) error {
 	splinters, err := rc.client.ListSplinters(ctx)
@@ -215,8 +296,8 @@ func (rc *RiftClient) refreshSplinters(ctx context.Context) error {
 	return nil
 }
 
-// bridgedChannelTypes are the Shard channel types that carry plain chat messages.
-var bridgedChannelTypes = map[string]bool{"text": true, "announcement": true}
+// bridgedChannelTypes are the Shard channel types bridged as Matrix rooms.
+var bridgedChannelTypes = map[string]bool{"text": true, "announcement": true, "forum": true, "thread": true}
 
 // syncChats creates or updates a portal for every Shard space, DM, Splinter and text channel. LatestMessageTS lets
 // bridgev2 run a catch-up backfill for chats that got messages while the bridge was offline.
@@ -306,13 +387,14 @@ var riftFormatting = event.FormattingFeatureMap{
 
 var (
 	channelCaps = &event.RoomFeatures{
-		ID:            "fi.mau.rift.capabilities.2026_11_22.channel",
+		ID:            "fi.mau.rift.capabilities.2026_11_24.channel",
 		Formatting:    riftFormatting,
 		MaxTextLength: 8000,
 		Edit:          event.CapLevelFullySupported,
 		Delete:        event.CapLevelFullySupported,
 		Reaction:      event.CapLevelFullySupported,
 		Reply:         event.CapLevelFullySupported,
+		Thread:        event.CapLevelFullySupported,
 		File: event.FileFeatureMap{
 			event.MsgImage:  riftFileFeatures,
 			event.MsgVideo:  riftFileFeatures,
@@ -323,7 +405,7 @@ var (
 	}
 	// DM attachments aren't E2EE (only the text is), same as on Rift itself.
 	dmCaps = &event.RoomFeatures{
-		ID:            "fi.mau.rift.capabilities.2026_11_22.dm",
+		ID:            "fi.mau.rift.capabilities.2026_11_24.dm",
 		Formatting:    riftFormatting,
 		File:          channelCaps.File,
 		MaxTextLength: 8000,
@@ -331,12 +413,27 @@ var (
 		Delete:        event.CapLevelFullySupported,
 		Reaction:      event.CapLevelFullySupported,
 		Reply:         event.CapLevelFullySupported,
+		Thread:        event.CapLevelFullySupported,
 	}
 )
 
+// forumCaps: every top-level message in a forum is a post, so a Matrix reply to a post can only mean
+// "reply inside that post". Without reply support, bridgev2 turns replies from clients that can't send
+// threads (like Beeper) into thread messages on the replied-to post.
+var forumCaps = func() *event.RoomFeatures {
+	c := *channelCaps
+	c.ID = "fi.mau.rift.capabilities.2026_11_24.forum"
+	c.Reply = event.CapLevelUnsupported
+	return &c
+}()
+
 func (rc *RiftClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
-	if portal.Metadata.(*PortalMetadata).Kind == PortalKindDM {
+	meta := portal.Metadata.(*PortalMetadata)
+	switch {
+	case meta.Kind == PortalKindDM:
 		return dmCaps
+	case meta.ChannelType == "forum":
+		return forumCaps
 	}
 	return channelCaps
 }

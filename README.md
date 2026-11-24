@@ -6,10 +6,26 @@ A Matrix ↔ [Rift](https://therift.chat) puppeting bridge, built on
 
 ## Features
 
-Shard channels and 1:1 DMs (including Rift's end-to-end encryption): messages, replies, edits,
-deletes, reactions, media, formatting, mentions, history backfill, typing and read markers.
+Shard channels, forums, threads (message threads and named channel threads), Splinters (group
+chats), and 1:1 DMs (including Rift's end-to-end encryption): messages, replies, edits, deletes,
+reactions, media, formatting, mentions, history backfill, typing and read markers.
 
-Not yet: Splinters (group chats), threads and forums.
+### Limitations in Beeper
+
+Beeper has no thread view, so some Rift features are mapped onto plain messages:
+
+- **Message threads** are bridged as Matrix threads, which Beeper shows inline as replies to the
+  thread's first message. Replying to a message that's already in a thread continues that thread.
+  You can't start a new thread from Beeper: a reply to a top-level channel message stays a normal
+  reply.
+- **Forums** become one room where every post is a message, with its title as a heading. Replying
+  to a post (or to a reply inside it) replies inside that post. A new message creates a new post:
+  the first line is the title and the rest is the body. Editing a post changes only its body.
+  Tags, categories and open/closed state aren't bridged.
+- **Named threads** are separate rooms (`#channel › thread`) in the Shard's space.
+- **Channel permissions** aren't applied: every channel room lists all Shard members.
+- Voice, gallery, poll and counting channels aren't bridged. Splinter members can't be added or
+  removed from Beeper. Rift doesn't share other people's read state.
 
 ## Setup
 

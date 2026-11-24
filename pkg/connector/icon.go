@@ -48,17 +48,41 @@ func (rc *RiftConnector) updateBotProfile(ctx context.Context) {
 	}
 }
 
-// ensureSpaceAvatar sets the Rift logo on the login's personal space. bridgev2 only sets it when it
-// creates the space, so spaces created before the icon existed (or by older versions) stay blank.
+// ensureSpaceAvatar backfills the Rift logo and m.bridge metadata on the login's personal space
+// and management room. bridgev2 only sets these on room creation, so rooms created before the icon
+// existed (and SpaceRoom's m.bridge, which ResendBridgeInfo doesn't touch) would otherwise stay blank.
 func (rc *RiftClient) ensureSpaceAvatar(ctx context.Context) {
 	icon := rc.main.networkIcon
-	if icon == "" || rc.login.SpaceRoom == "" {
+	if icon == "" {
 		return
 	}
-	_, err := rc.main.Bridge.Bot.SendState(ctx, rc.login.SpaceRoom, event.StateRoomAvatar, "", &event.Content{
-		Parsed: &event.RoomAvatarEventContent{URL: icon},
-	}, time.Now())
-	if err != nil {
-		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to set personal space avatar")
+	log := zerolog.Ctx(ctx)
+	bot := rc.main.Bridge.Bot
+	if rc.login.SpaceRoom != "" {
+		if _, err := bot.SendState(ctx, rc.login.SpaceRoom, event.StateRoomAvatar, "", &event.Content{
+			Parsed: &event.RoomAvatarEventContent{URL: icon},
+		}, time.Now()); err != nil {
+			log.Warn().Err(err).Msg("Failed to set personal space avatar")
+		}
+		if _, err := bot.SendState(ctx, rc.login.SpaceRoom, event.StateBridge, "", &event.Content{
+			Parsed: &event.BridgeEventContent{
+				BridgeBot: bot.GetMXID(),
+				Protocol:  rc.main.GetName().AsBridgeInfoSection(),
+				Channel: event.BridgeInfoSection{
+					ID:       "__personal_filtering_space__",
+					Receiver: string(rc.login.ID),
+				},
+				BeeperRoomTypeV2: "personal_filtering_space",
+			},
+		}, time.Now()); err != nil {
+			log.Warn().Err(err).Msg("Failed to update personal space bridge info")
+		}
+	}
+	if rc.login.User != nil && rc.login.User.ManagementRoom != "" {
+		if _, err := bot.SendState(ctx, rc.login.User.ManagementRoom, event.StateRoomAvatar, "", &event.Content{
+			Parsed: &event.RoomAvatarEventContent{URL: icon},
+		}, time.Now()); err != nil {
+			log.Warn().Err(err).Msg("Failed to set management room avatar")
+		}
 	}
 }

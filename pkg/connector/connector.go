@@ -56,7 +56,7 @@ func (rc *RiftConnector) GetConfig() (string, any, configupgrade.Upgrader) {
 }
 
 func (rc *RiftConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 2, 4
+	return 3, 4
 }
 
 func (rc *RiftConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {

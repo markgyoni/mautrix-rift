@@ -58,3 +58,41 @@ jobs:
             COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history + tags, to find the previous release
+      - name: Generate changelog
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
+          range=${prev:+$prev..}$TAG
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --reverse --format='- %s (%h)' "$range"
+            echo
+            [ -n "$prev" ] && echo "**Full changelog:** https://github.com/$REPO/compare/$prev...$TAG" && echo
+            echo "## Docker image"
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/${REPO,,}:${TAG#v}"
+            echo '```'
+          } > notes.md
+          cat notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=$([[ $TAG == *-* ]] && echo --prerelease || true)
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag $prerelease

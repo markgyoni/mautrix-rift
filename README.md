@@ -54,9 +54,17 @@ Beeper has no thread view, so some Rift features are mapped onto plain messages:
          - ./data:/data
    ```
 
-4. In Beeper, message `@sh-riftbot:beeper.local` with `login`. Enter your Rift username and
-   password, then approve the 9-digit code from a device where you're signed in to Rift. You can
-   use your 12-word Rift Key instead. Two-factor auth works with both.
+4. Log in to Rift. The recommended way is Beeper Desktop: open **Settings → Bridges**, find
+   `sh-rift` under "Self-hosted bridges", open its **⋮** menu and choose
+   **Experimental: Add an account**. The Bridges section only appears after the bridge has been
+   registered with bbctl, and this option is only in the desktop app.
+
+   On other clients, or if that option is missing, message `@sh-riftbot:beeper.local` with `login`
+   instead.
+
+   Either way, enter your Rift username and password, then approve the 9-digit code from a device
+   where you're signed in to Rift. You can use your 12-word Rift Key instead. Two-factor auth works
+   with both.
 
 Run only one copy of the bridge per config, or the copies will log each other out.
 

@@ -10,6 +10,8 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/markgyoni/mautrix-rift/pkg/riftclient"
 )
 
 // Custom emoji are "<:shortcode:r2Key>" tokens in reactions, and customEmoji{shortcode, r2Key} nodes
@@ -26,6 +28,81 @@ func parseCustomEmoji(s string) (shortcode, r2Key string, ok bool) {
 
 func customEmojiTokenFor(shortcode, r2Key string) string {
 	return "<:" + shortcode + ":" + r2Key + ">"
+}
+
+// In messages, the web client sends custom emoji as the same tokens inside plain text (the content
+// field and content_ast text nodes, seen live), and renders them by scanning text for
+// /<:[a-z0-9_]+:[^>]+>/. So tokens have to be found in text, not only in customEmoji nodes.
+var customEmojiInText = regexp.MustCompile(`<:([A-Za-z0-9_]{1,32}):([^>\s]{1,1000})>`)
+
+// replaceEmojiTokens turns custom emoji tokens into ":shortcode:" for plain-text bodies.
+func replaceEmojiTokens(s string) string {
+	return customEmojiInText.ReplaceAllString(s, ":$1:")
+}
+
+// textToAST wraps plain text in a document (one unformatted paragraph per line).
+func textToAST(text string) *riftclient.Node {
+	doc := &riftclient.Node{Type: "doc"}
+	for _, line := range strings.Split(text, "\n") {
+		p := &riftclient.Node{Type: "paragraph"}
+		if line != "" {
+			p.Content = []*riftclient.Node{{Type: "text", Text: line}}
+		}
+		doc.Content = append(doc.Content, p)
+	}
+	return doc
+}
+
+// expandCustomEmoji splits custom emoji tokens in text nodes into customEmoji nodes, keeping the
+// text's marks. Code (inline marks and code blocks) is left as it is.
+func expandCustomEmoji(n *riftclient.Node) {
+	if n == nil || n.Type == "codeBlock" || n.Type == "code_block" {
+		return
+	}
+	var out []*riftclient.Node
+	for _, c := range n.Content {
+		if c.Type != "text" || hasMark(c, "code") || !strings.Contains(c.Text, "<:") {
+			expandCustomEmoji(c)
+			out = append(out, c)
+			continue
+		}
+		last := 0
+		for _, m := range customEmojiInText.FindAllStringSubmatchIndex(c.Text, -1) {
+			if m[0] > last {
+				out = append(out, &riftclient.Node{Type: "text", Text: c.Text[last:m[0]], Marks: c.Marks})
+			}
+			out = append(out, &riftclient.Node{Type: "customEmoji", Marks: c.Marks, Attrs: map[string]any{
+				"shortcode": c.Text[m[2]:m[3]], "r2Key": c.Text[m[4]:m[5]],
+			}})
+			last = m[1]
+		}
+		if last < len(c.Text) {
+			out = append(out, &riftclient.Node{Type: "text", Text: c.Text[last:], Marks: c.Marks})
+		}
+	}
+	n.Content = out
+}
+
+// withEmojiTokens returns the content text to send with an AST: when the AST carries custom emoji
+// tokens (from Matrix emoticons), the Matrix body only has their ":shortcode:" alt text, so the
+// text is rebuilt from the AST, as the web client's content holds the tokens.
+func withEmojiTokens(text string, ast *riftclient.Node) string {
+	if ast == nil {
+		return text
+	}
+	if plain := ast.PlainText(); customEmojiInText.MatchString(plain) {
+		return plain
+	}
+	return text
+}
+
+func hasMark(n *riftclient.Node, typ string) bool {
+	for _, m := range n.Marks {
+		if m.Type == typ {
+			return true
+		}
+	}
+	return false
 }
 
 // KV entries: R2 key -> mxc (so each emoji is uploaded once) and mxc -> token (so Matrix reactions

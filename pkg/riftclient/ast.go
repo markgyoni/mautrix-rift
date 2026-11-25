@@ -15,6 +15,7 @@ import (
 //	        tableHeader, tableCell, horizontalRule|divider, detailsSummary, image{alt}
 //	inline: text, hardBreak, mention{id,label,kind?}, channel_mention{id,label},
 //	        timestamp{unix,style}, emoji|customEmoji{shortcode}
+//	        (live messages carry custom emoji as "<:shortcode:r2Key>" tokens inside text nodes)
 //	marks:  bold, italic, underline, strike, code, link{href}, spoiler, color (value="#hex"),
 //	        superscript, subscript
 //

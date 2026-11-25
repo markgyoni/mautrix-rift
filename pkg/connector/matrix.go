@@ -43,6 +43,7 @@ func (rc *RiftClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var ast *riftclient.Node
 	if text != "" {
 		ast = rc.matrixToRift(ctx, msg.Content, text)
+		text = withEmojiTokens(text, ast)
 		if msg.Content.MsgType == event.MsgEmote {
 			text = "*" + text + "*"
 			ast = emoteAST(ast)
@@ -128,11 +129,13 @@ func (rc *RiftClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Matrix
 		if err != nil {
 			return err
 		}
-		plain := riftclient.EncodeDMPlaintext(msg.Content.Body, rc.matrixToRift(ctx, msg.Content, msg.Content.Body))
+		ast := rc.matrixToRift(ctx, msg.Content, msg.Content.Body)
+		plain := riftclient.EncodeDMPlaintext(withEmojiTokens(msg.Content.Body, ast), ast)
 		return rc.client.EditDM(ctx, rc.keys, dmID, msgID, firstNonEmpty(orig.ClientMessageID, msgID), orig.ThreadID, peerKey, plain)
 	}
 	text := msg.Content.Body
 	ast := rc.matrixToRift(ctx, msg.Content, text)
+	text = withEmojiTokens(text, ast)
 	meta := msg.Portal.Metadata.(*PortalMetadata)
 	if meta.Kind == PortalKindSplinter {
 		return rc.client.EditSplinterMessage(ctx, string(msg.Portal.ID), string(msg.EditTarget.ID), text, ast)

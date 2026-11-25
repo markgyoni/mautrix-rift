@@ -24,10 +24,14 @@ import (
 // astToMatrix builds Matrix message content from a Rift document. body is the Rift-side plain text
 // (the message's content field, or the DM envelope text); the AST supplies formatted_body.
 func (rc *RiftClient) astToMatrix(ctx context.Context, ast *riftclient.Node, body string) *event.MessageEventContent {
-	content := &event.MessageEventContent{MsgType: event.MsgText, Body: body}
+	if ast == nil && customEmojiInText.MatchString(body) {
+		ast = textToAST(body)
+	}
+	content := &event.MessageEventContent{MsgType: event.MsgText, Body: replaceEmojiTokens(body)}
 	if ast == nil {
 		return content
 	}
+	expandCustomEmoji(ast)
 	if body == "" {
 		content.Body = ast.PlainText()
 	}
@@ -571,9 +575,9 @@ func (p *htmlParser) inline(n *nethtml.Node, marks []riftclient.Mark) []*riftcli
 		}
 		return []*riftclient.Node{{Type: "text", Text: text, Marks: addMark(marks, riftclient.Mark{Type: "code"})}}
 	case atom.Img:
-		// Emoticons that came from Rift go back as custom emoji; other images degrade to their alt text.
-		if node := p.customEmoji(n); node != nil {
-			return []*riftclient.Node{node}
+		// Emoticons that came from Rift go back as custom emoji tokens; other images degrade to their alt text.
+		if token := p.customEmojiToken(n); token != "" {
+			return []*riftclient.Node{{Type: "text", Text: token, Marks: marks}}
 		}
 		if alt := attr(n, "alt"); alt != "" {
 			return []*riftclient.Node{{Type: "text", Text: alt, Marks: marks}}
@@ -642,16 +646,17 @@ func (r *htmlRenderer) emoji(n *riftclient.Node) string {
 	return fmt.Sprintf(`<img data-mx-emoticon height="32" src="%s" alt="%s" title="%s">`, html.EscapeString(string(mxc)), alt, alt)
 }
 
-// customEmoji maps an <img> of a bridged Rift emoji back to a customEmoji node.
-func (p *htmlParser) customEmoji(n *nethtml.Node) *riftclient.Node {
+// customEmojiToken maps an <img> of a bridged Rift emoji back to its "<:shortcode:r2Key>" token.
+// The web client sends custom emoji as that token inside a text node (seen live), not as a
+// customEmoji node.
+func (p *htmlParser) customEmojiToken(n *nethtml.Node) string {
 	src := attr(n, "src")
 	if !strings.HasPrefix(src, "mxc://") {
-		return nil
+		return ""
 	}
 	token := p.rc.main.Bridge.DB.KV.Get(p.ctx, kvEmojiToken(id.ContentURIString(src)))
-	sc, r2Key, ok := parseCustomEmoji(token)
-	if !ok {
-		return nil
+	if _, _, ok := parseCustomEmoji(token); !ok {
+		return ""
 	}
-	return &riftclient.Node{Type: "customEmoji", Attrs: map[string]any{"shortcode": sc, "r2Key": r2Key}}
+	return token
 }
